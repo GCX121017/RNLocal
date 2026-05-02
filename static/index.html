@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>牵制网络 - Living Room</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; }
+        #status { padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
+        .connecting { background: #fff3cd; color: #856404; }
+        .connected  { background: #d4edda; color: #155724; }
+        .disconnected { background: #f8d7da; color: #721c24; }
+        .maintenance { background: #ffc107; color: #856404; }
+        .card { border: 1px solid #ddd; padding: 0.8rem; margin: 0.5rem 0; border-radius: 6px; }
+        .post .author { font-weight: bold; color: #2c3e50; }
+        .post .content { margin: 0.3rem 0; }
+        .post .meta { font-size: 0.85rem; color: #666; }
+        .comment { margin-left: 2rem; border-left: 3px solid #eee; padding-left: 1rem; margin-top: 0.5rem; }
+        .comment .author { font-weight: bold; }
+        button { margin-right: 0.3rem; }
+        form { display: flex; gap: 0.5rem; margin: 0.5rem 0; }
+        input[type="text"], input[type="password"] { padding: 0.5rem; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="status" class="connecting">⏳ 连接中...</div>
+    <div id="app"></div>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const appDiv = document.getElementById('app');
+        let ws;
+        let token = localStorage.getItem('rn_token');
+        let ddosMode = false;
+
+        function setStatus(text, className) {
+            statusDiv.textContent = text;
+            statusDiv.className = className;
+        }
+
+        function connect() {
+            setStatus('⏳ 连接中...', 'connecting');
+            ws = new WebSocket(`ws://${location.host}/ws`);
+
+            ws.onopen = () => {
+                ddosMode = false;
+                setStatus('✅ 已连接', 'connected');
+                if (token) {
+                    ws.send(JSON.stringify({ action: 'auto_login', token }));
+                } else {
+                    ws.send(JSON.stringify({ action: 'get_page', page: 'login' }));
+                }
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                switch (msg.action) {
+                    case 'render_page':
+                        appDiv.innerHTML = msg.html;
+                        bindAppEvents();
+                        if (msg.page === 'main' && token) {
+                            ws.send(JSON.stringify({ action: 'get_posts', token }));
+                        }
+                        break;
+                    case 'auth_success':
+                        token = msg.token;
+                        localStorage.setItem('rn_token', token);
+                        ws.send(JSON.stringify({ action: 'get_page', page: 'main', token }));
+                        break;
+                    case 'auth_failed':
+                        alert(msg.reason || '认证失败');
+                        token = null;
+                        localStorage.removeItem('rn_token');
+                        ws.send(JSON.stringify({ action: 'get_page', page: 'login' }));
+                        break;
+                    case 'posts':
+                        updatePosts(msg.posts);
+                        break;
+                    case 'new_post':
+                        prependPost(msg.post);
+                        break;
+                    case 'new_comment':
+                        addComment(msg.comment);
+                        break;
+                    case 'like_update':
+                        updateLike(msg.target_id, msg.likes);
+                        break;
+                    case 'ddos_maintenance':
+                        ddosMode = true;
+                        setStatus('🛡️ DDoS 攻击，请谅解，我们的系统正在努力维护……', 'maintenance');
+                        break;
+                    case 'error':
+                        alert(msg.error);
+                        break;
+                }
+            };
+
+            ws.onclose = () => {
+                if (ddosMode) {
+                    setStatus('🛡️ DDoS 攻击，请谅解，我们的系统正在努力维护……', 'maintenance');
+                } else {
+                    setStatus('❌ 连接断开，5 秒后重连...', 'disconnected');
+                }
+                setTimeout(connect, 5000);
+            };
+            ws.onerror = () => ws.close();
+        }
+
+        function bindAppEvents() {
+            appDiv.addEventListener('submit', e => {
+                e.preventDefault();
+                const form = e.target;
+                const action = form.dataset.action;
+                if (!action) return;
+                const formData = new FormData(form);
+                const data = Object.fromEntries(formData.entries());
+                if (token) data.token = token;
+                ws.send(JSON.stringify({ action, ...data }));
+            });
+
+            appDiv.addEventListener('click', e => {
+                const btn = e.target.closest('button[data-action]');
+                if (!btn) return;
+                const action = btn.dataset.action;
+
+                // 纯前端操作，不发往服务器
+                if (action === 'show_comment_form') {
+                    const postId = btn.dataset.post_id;
+                    const form = document.getElementById(`commentForm-${postId}`);
+                    if (form) form.classList.toggle('hidden');
+                    return;
+                }
+                if (action === 'logout') {
+                    token = null;
+                    localStorage.removeItem('rn_token');
+                    ws.send(JSON.stringify({ action: 'get_page', page: 'login' }));
+                    return;
+                }
+
+                // 其他操作发往服务器
+                const payload = { action, token };
+                for (const attr of btn.attributes) {
+                    if (attr.name.startsWith('data-') && attr.name !== 'data-action') {
+                        payload[attr.name.replace('data-', '')] = attr.value;
+                    }
+                }
+                ws.send(JSON.stringify(payload));
+            });
+        }
+
+        function updatePosts(posts) {
+            const container = document.getElementById('posts');
+            if (!container) return;
+            container.innerHTML = '';
+            if (posts) posts.forEach(post => renderPost(post, 'append'));
+        }
+
+        function prependPost(post) {
+            renderPost(post, 'prepend');
+        }
+
+        function renderPost(post, mode = 'append') {
+            const container = document.getElementById('posts');
+            if (!container) return;
+            const div = document.createElement('div');
+            div.className = 'card post';
+            div.id = post.id;
+            div.innerHTML = `
+                <div class="author">${esc(post.author)}</div>
+                <div class="content">${esc(post.content)}</div>
+                <div class="meta">🕒 ${post.timestamp} | ❤️ <span class="like-count">${post.likes||0}</span></div>
+                <button data-action="toggle_like" data-target_id="${post.id}" data-target_type="post">👍 点赞</button>
+                <button data-action="show_comment_form" data-post_id="${post.id}">💬 评论</button>
+                <div class="comments" id="comments-${post.id}"></div>
+                <div class="comment-form hidden" id="commentForm-${post.id}">
+                    <input type="text" class="comment-input" placeholder="写下评论..." />
+                    <button data-action="create_comment" data-post_id="${post.id}">发送</button>
+                </div>
+            `;
+            if (mode === 'prepend') container.prepend(div);
+            else container.appendChild(div);
+            if (post.comments) post.comments.forEach(c => addComment(c));
+        }
+
+        function addComment(comment) {
+            const container = document.getElementById(`comments-${comment.post_id}`);
+            if (!container) return;
+            if (document.getElementById(comment.id)) return;
+            const div = document.createElement('div');
+            div.className = 'comment';
+            div.id = comment.id;
+            div.innerHTML = `
+                <span class="author">${esc(comment.author)}</span>：${esc(comment.content)}
+                <span class="meta"> | ❤️ <span class="like-count">${comment.likes||0}</span></span>
+                <button data-action="toggle_like" data-target_id="${comment.id}" data-target_type="comment">👍</button>
+            `;
+            container.appendChild(div);
+        }
+
+        function updateLike(targetId, newLikes) {
+            const el = document.getElementById(targetId);
+            if (el) {
+                const countEl = el.querySelector('.like-count');
+                if (countEl) countEl.textContent = newLikes;
+            }
+        }
+
+        function esc(s) {
+            const d = document.createElement('div');
+            d.textContent = s;
+            return d.innerHTML;
+        }
+
+        connect();
+    </script>
+</body>
+</html>
